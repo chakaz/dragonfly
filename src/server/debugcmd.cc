@@ -112,6 +112,8 @@ void DebugCmd::Run(CmdArgList args) {
         "    If <size> is specified then X character is concatenated multiple times to value:<num>",
         "    to meet value size.",
         "    If RAND is specified than value will be set to random hex string in specified size.",
+        "TYPEZ",
+        "    Show counts per type, returned as an array. Example: ['string', '5', 'set', '6', ...]",
         "HELP",
         "    Prints this help.",
     };
@@ -147,6 +149,10 @@ void DebugCmd::Run(CmdArgList args) {
 
   if (subcmd == "TRANSACTION") {
     return TxAnalysis();
+  }
+
+  if (subcmd == "TYPEZ") {
+    return TypezCount();
   }
 
   string reply = UnknownSubCmd(subcmd, "DEBUG");
@@ -496,6 +502,40 @@ void DebugCmd::TxAnalysis() {
 
   (*cntx_)->SendSimpleString(absl::StrCat("queue_len:", queue_len.load(),
                                           "armed: ", armed_cnt.load(), " free:", free_cnt.load()));
+}
+
+void DebugCmd::TypezCount() {
+  boost::fibers::mutex mu;                 // guards counts
+  std::map<std::string, uint64_t> counts;  // ordered-map for consistent output order
+
+  sf_.service().proactor_pool().AwaitFiberOnAll([&](ProactorBase* pb) {
+    lock_guard lk(mu);
+    for (const auto& [k, v] : CompactObj::GetObjectCounts()) {
+      counts[k] += v;
+    }
+  });
+
+  if (auto it = counts.find("STRING"); it != counts.end()) {
+    // Keys are CompactObj of type string, so we need to subtract their count
+    shard_set->RunBriefInParallel([&](EngineShard* shard) {
+      lock_guard lk(mu);
+      for (const auto& db : shard->db_slice().databases()) {
+        it->second -= db->stats.inline_keys;
+      }
+    });
+  }
+
+  std::vector<std::string> result;
+  result.reserve(counts.size() * 2);
+  for (const auto& [k, v] : counts) {
+    if (v == 0) {
+      continue;
+    }
+
+    result.push_back(k);
+    result.push_back(absl::StrCat(v));
+  }
+  (*cntx_)->SendStringArr(result);
 }
 
 }  // namespace dfly

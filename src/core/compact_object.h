@@ -5,6 +5,7 @@
 #pragma once
 
 #include <absl/base/internal/endian.h>
+#include <absl/container/flat_hash_map.h>
 
 #include <memory_resource>
 #include <optional>
@@ -107,20 +108,10 @@ class CompactObj {
  public:
   using PrefixArray = std::vector<std::string_view>;
 
-  CompactObj() {  // By default - empty string.
-  }
-
-  explicit CompactObj(robj* o) {
-    ImportRObj(o);
-  }
-
-  explicit CompactObj(std::string_view str) {
-    SetString(str);
-  }
-
-  CompactObj(CompactObj&& cs) noexcept {
-    operator=(std::move(cs));
-  };
+  CompactObj();  // By default - empty string.
+  explicit CompactObj(robj* o);
+  explicit CompactObj(std::string_view str);
+  CompactObj(CompactObj&& cs) noexcept;
 
   ~CompactObj();
 
@@ -291,6 +282,8 @@ class CompactObj {
 
   static Stats GetStats();
 
+  static absl::flat_hash_map<std::string, uint64_t> GetObjectCounts();  // thread-local data.
+
   static void InitThreadLocal(std::pmr::memory_resource* mr);
   static std::pmr::memory_resource* memory_resource();  // thread-local.
 
@@ -306,15 +299,7 @@ class CompactObj {
 
   bool CmpEncoded(std::string_view sv) const;
 
-  void SetMeta(uint8_t taglen, uint8_t mask = 0) {
-    if (HasAllocated()) {
-      Free();
-    } else {
-      memset(u_.inline_str, 0, kInlineLen);
-    }
-    taglen_ = taglen;
-    mask_ = mask;
-  }
+  void SetMeta(uint8_t taglen, uint8_t mask = 0);
 
   struct ExternalPtr {
     uint32_t type : 8;

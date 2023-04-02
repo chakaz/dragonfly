@@ -17,6 +17,7 @@ extern "C" {
 #include "redis/zset.h"
 }
 #include <absl/strings/str_cat.h>
+#include <absl/strings/strip.h>
 
 #include <jsoncons/json.hpp>
 
@@ -177,6 +178,45 @@ static_assert(ascii_len(15) == 17);
 static_assert(ascii_len(16) == 18);
 static_assert(ascii_len(17) == 19);
 
+class ObjectTypesCount {
+ public:
+  void Increment(uint32_t type) {
+    ++types_count_[type];
+  }
+
+  void Decrement(uint32_t type) {
+    DCHECK_GE(types_count_[type], 1U) << type;
+    --types_count_[type];
+  }
+
+  absl::flat_hash_map<std::string, uint64_t> GetCounts() const {
+    std::array<std::string, std::tuple_size<Array>::value> names;
+
+#define REGISTER_OBJECT_TYPE(type) names[type] = absl::StripPrefix(#type, "OBJ_")
+    REGISTER_OBJECT_TYPE(OBJ_STRING);
+    REGISTER_OBJECT_TYPE(OBJ_LIST);
+    REGISTER_OBJECT_TYPE(OBJ_SET);
+    REGISTER_OBJECT_TYPE(OBJ_ZSET);
+    REGISTER_OBJECT_TYPE(OBJ_HASH);
+    REGISTER_OBJECT_TYPE(OBJ_MODULE);
+    REGISTER_OBJECT_TYPE(OBJ_STREAM);
+#undef REGISTER_OBJECT_TYPE
+
+    absl::flat_hash_map<std::string, uint64_t> result;
+    for (size_t i = 0; i < types_count_.size(); ++i) {
+      if (types_count_[i] > 0) {
+        result[names[i]] += types_count_[i];
+      }
+    }
+    return result;
+  }
+
+ private:
+  using Array = std::array<uint64_t, OBJ_COUNT>;
+
+  Array types_count_ = {};
+};
+
 struct TL {
   robj tmp_robj{
       .type = 0, .encoding = 0, .lru = 0, .refcount = OBJ_STATIC_REFCOUNT, .ptr = nullptr};
@@ -185,6 +225,7 @@ struct TL {
   size_t small_str_bytes;
   base::PODArray<uint8_t> tmp_buf;
   string tmp_str;
+  ObjectTypesCount object_types_count;
 };
 
 thread_local TL tl;
@@ -409,12 +450,37 @@ auto CompactObj::GetStats() -> Stats {
   return res;
 }
 
+/* static */ absl::flat_hash_map<std::string, uint64_t> CompactObj::GetObjectCounts() {
+  return tl.object_types_count.GetCounts();
+}
+
 void CompactObj::InitThreadLocal(pmr::memory_resource* mr) {
   tl.local_mr = mr;
   tl.tmp_buf = base::PODArray<uint8_t>{mr};
 }
 
+CompactObj::CompactObj() {
+  tl.object_types_count.Increment(ObjType());
+}
+
+CompactObj::CompactObj(robj* o) {
+  tl.object_types_count.Increment(ObjType());
+  ImportRObj(o);
+}
+
+CompactObj::CompactObj(std::string_view str) {
+  tl.object_types_count.Increment(ObjType());
+  SetString(str);
+}
+
+CompactObj::CompactObj(CompactObj&& cs) noexcept {
+  tl.object_types_count.Increment(ObjType());
+  *this = std::move(cs);
+};
+
 CompactObj::~CompactObj() {
+  tl.object_types_count.Decrement(ObjType());
+
   if (HasAllocated()) {
     Free();
   }
@@ -429,6 +495,7 @@ CompactObj& CompactObj::operator=(CompactObj&& o) noexcept {
   // SetMeta deallocates the object and we only want reset it.
   o.taglen_ = 0;
   o.mask_ = 0;
+  tl.object_types_count.Increment(o.ObjType());  // Inc for `o` which may be destroyed
 
   return *this;
 }
@@ -554,6 +621,8 @@ void CompactObj::ImportRObj(robj* o) {
     if (o->refcount == 1)
       zfree(o);
   }
+
+  tl.object_types_count.Increment(ObjType());
 }
 
 robj* CompactObj::AsRObj() const {
@@ -578,6 +647,7 @@ void CompactObj::InitRobj(unsigned type, unsigned encoding, void* obj) {
   DCHECK_NE(type, OBJ_STRING);
   SetMeta(ROBJ_TAG, mask_);
   u_.r_obj.Init(type, encoding, obj);
+  tl.object_types_count.Increment(ObjType());
 }
 
 void CompactObj::SyncRObj() {
@@ -594,6 +664,7 @@ void CompactObj::SyncRObj() {
 void CompactObj::SetInt(int64_t val) {
   if (INT_TAG != taglen_) {
     SetMeta(INT_TAG, mask_ & ~kEncMask);
+    tl.object_types_count.Increment(ObjType());
   }
 
   u_.ival = val;
@@ -621,6 +692,7 @@ void CompactObj::SetJson(JsonType&& j) {
     SetMeta(JSON_TAG);
     void* ptr = tl.local_mr->allocate(sizeof(JsonType), kAlignSize);
     u_.json_obj.json_ptr = new (ptr) JsonType(std::move(j));
+    tl.object_types_count.Increment(ObjType());
   }
 }
 
@@ -636,6 +708,7 @@ void CompactObj::SetString(std::string_view str) {
     if (string2ll(str.data(), str.size(), &ival)) {
       SetMeta(INT_TAG, mask);
       u_.ival = ival;
+      tl.object_types_count.Increment(ObjType());
 
       return;
     }
@@ -644,6 +717,7 @@ void CompactObj::SetString(std::string_view str) {
       SetMeta(str.size(), mask);
       if (!str.empty())
         memcpy(u_.inline_str, str.data(), str.size());
+      tl.object_types_count.Increment(ObjType());
       return;
     }
   }
@@ -672,6 +746,7 @@ void CompactObj::SetString(std::string_view str) {
     if (encoded.size() <= kInlineLen) {
       SetMeta(encoded.size(), mask);
       detail::ascii_pack(str.data(), str.size(), reinterpret_cast<uint8_t*>(u_.inline_str));
+      tl.object_types_count.Increment(ObjType());
 
       return;
     }
@@ -681,6 +756,7 @@ void CompactObj::SetString(std::string_view str) {
     if ((taglen_ == 0 && encoded.size() < (1 << 15))) {
       SetMeta(SMALL_TAG, mask);
       tl.small_str_bytes += u_.small_str.Assign(encoded);
+      tl.object_types_count.Increment(ObjType());
       return;
     }
 
@@ -694,6 +770,7 @@ void CompactObj::SetString(std::string_view str) {
 
   SetMeta(ROBJ_TAG, mask);
   u_.r_obj.SetString(encoded, tl.local_mr);
+  tl.object_types_count.Increment(ObjType());
 }
 
 string_view CompactObj::GetSlice(string* scratch) const {
@@ -879,6 +956,7 @@ void CompactObj::SetExternal(size_t offset, size_t sz) {
   u_.ext_ptr.page_index = offset / 4096;
   u_.ext_ptr.page_offset = offset % 4096;
   u_.ext_ptr.size = sz;
+  tl.object_types_count.Increment(ObjType());
 }
 
 std::pair<size_t, size_t> CompactObj::GetExternalSlice() const {
@@ -888,11 +966,14 @@ std::pair<size_t, size_t> CompactObj::GetExternalSlice() const {
 }
 
 void CompactObj::Reset() {
+  tl.object_types_count.Decrement(ObjType());
+
   if (HasAllocated()) {
     Free();
   }
   taglen_ = 0;
   mask_ = 0;
+  tl.object_types_count.Increment(ObjType());
 }
 
 // Frees all resources if owns.
@@ -1054,6 +1135,18 @@ bool CompactObj::CmpEncoded(string_view sv) const {
   }
   LOG(FATAL) << "Unsupported tag " << int(taglen_);
   return false;
+}
+
+void CompactObj::SetMeta(uint8_t taglen, uint8_t mask) {
+  tl.object_types_count.Decrement(ObjType());
+
+  if (HasAllocated()) {
+    Free();
+  } else {
+    memset(u_.inline_str, 0, kInlineLen);
+  }
+  taglen_ = taglen;
+  mask_ = mask;
 }
 
 size_t CompactObj::DecodedLen(size_t sz) const {
