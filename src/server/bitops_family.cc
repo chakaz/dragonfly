@@ -580,7 +580,93 @@ void BitCount(CmdArgList args, ConnectionContext* cntx) {
   HandleOpValueResult(res, cntx);
 }
 
+namespace {
+using BitfieldFunctionVector = std::vector<std::function<int64_t()>>;
+
+bool UpdateBitfieldOverflow(CmdArgList& args, BitfieldOverflowMode& mode) {
+  if (args.size() != 2) {
+    return false;
+  }
+  ToUpper(&args[1]);
+  std::string_view new_mode = ArgS(args, 1);
+  if (new_mode == "WRAP") {
+    mode = BitfieldOverflowMode::kWrap;
+  } else if (new_mode == "SAT") {
+    mode = BitfieldOverflowMode::kSat;
+  } else if (new_mode == "FAIL") {
+    mode = BitfieldOverflowMode::kFail;
+  } else {
+    return false;
+  }
+  args.remove_prefix(2);
+  return true;
+}
+
+std::function<int64_t()> GetBitfieldGetFunction(CmdArgList& args) {
+  DCHECK_EQ(ArgS(args, 0), "GET");
+
+  if (args.size() < 3) {
+    return nullptr;
+  }
+
+  uint64_t offset = 0;
+  if (!absl::SimpleAtoi(ArgS(args, 1), &offset)) {
+    return nullptr;
+  }
+
+  if (
+}
+
+// Returns false if `args` is invalid, otherwise removes all sub-command relevant args from `args`.
+// If both needed and successful, adds a function to `functions_to_run`.
+bool ConsumeBitFieldSubCommand(CmdArgList& args, BitfieldOverflowMode& mode,
+                               BitfieldFunctionVector& functions_to_run) {
+  CHECK_GE(args.size(), 1U);
+
+  ToUpper(&args[0]);
+  std::string_view sub_command = ArgS(args, 0);
+
+  if (sub_command == "OVERFLOW") {
+    return UpdateBitfieldOverflow(args, mode);
+  }
+
+  std::function<int64_t()> func;
+  if (sub_command == "GET") {
+    func = GetBitfieldGetFunction(args);
+  } else if (sub_command == "SET") {
+    func = GetBitfieldSetFunction(args);
+  } else if (sub_command == "INCRBY") {
+    func = GetBitfieldIncrementFunction(args);
+  }
+
+  if (!func) {
+    return false;
+  }
+
+  functions_to_run.push_back(std::move(func));
+  return true;
+}
+}  // anonymous namespace
+
 void BitField(CmdArgList args, ConnectionContext* cntx) {
+  LOG(ERROR) << "XXX INSIDE BITFIELD";
+  // Support for the command BITFIELD
+  // See details at https://redis.io/commands/bitfield/
+
+  if (args.empty()) {
+    return (*cntx)->SendError(kSyntaxErr);
+  }
+
+  BitfieldFunctionVector functions;
+  std::string_view key = ArgS(args, 0);
+  BitfieldOverflowMode overflow_mode = BitfieldOverflowMode::kWrap;
+  args.remove_prefix(1);
+  while (!args.empty()) {
+    if (!ConsumeBitFieldSubCommand(args, overflow_mode, functions)) {
+      return (*cntx)->SendError(kSyntaxErr);
+    }
+  }
+
   (*cntx)->SendLong(0);
 }
 
@@ -837,7 +923,7 @@ void BitOpsFamily::Register(CommandRegistry* registry) {
 
   *registry << CI{"BITPOS", CO::CommandOpt::READONLY, -3, 1, 1, 1}.SetHandler(&BitPos)
             << CI{"BITCOUNT", CO::READONLY, -2, 1, 1, 1}.SetHandler(&BitCount)
-            << CI{"BITFIELD", CO::WRITE, -3, 1, 1, 1}.SetHandler(&BitField)
+            << CI{"BITFIELD", CO::WRITE, -2, 1, 1, 1}.SetHandler(&BitField)
             << CI{"BITFIELD_RO", CO::READONLY, -5, 1, 1, 1}.SetHandler(&BitFieldRo)
             << CI{"BITOP", CO::WRITE | CO::NO_AUTOJOURNAL, -4, 2, -1, 1}.SetHandler(&BitOp)
             << CI{"GETBIT", CO::READONLY | CO::FAST | CO::FAST, 3, 1, 1, 1}.SetHandler(&GetBit)
