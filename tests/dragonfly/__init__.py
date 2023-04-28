@@ -88,7 +88,9 @@ class DflyInstance:
     def format_args(args):
         out = []
         for (k, v) in args.items():
-            out.extend((str(s) for s in ("--"+k, v) if s != ""))
+            out.append(f"--{k}")
+            if v is not None:
+                out.append(str(v))
         return out
 
 
@@ -104,6 +106,7 @@ class DflyInstanceFactory:
 
     def create(self, **kwargs) -> DflyInstance:
         args = {**self.args, **kwargs}
+        args.setdefault("dbfilename", "")
         for k, v in args.items():
             args[k] = v.format(**self.params.env) if isinstance(v, str) else v
 

@@ -5,6 +5,7 @@
 #pragma once
 
 #include <absl/container/fixed_array.h>
+#include <mimalloc.h>
 #include <sys/socket.h>
 
 #include <deque>
@@ -31,6 +32,12 @@ typedef struct mi_heap_s mi_heap_t;
 #define SO_INCOMING_NAPI_ID 56
 #endif
 
+#ifdef ABSL_HAVE_ADDRESS_SANITIZER
+constexpr size_t kReqStorageSize = 88;
+#else
+constexpr size_t kReqStorageSize = 120;
+#endif
+
 namespace facade {
 
 class ConnectionContext;
@@ -38,67 +45,106 @@ class RedisParser;
 class ServiceInterface;
 class MemcacheParser;
 
+// Connection represents an active connection for a client.
+//
+// It directly dispatches regular commands from the io-loop.
+// For pipelined requests, monitor and pubsub messages it uses
+// a separate dispatch queue that is processed on a separate fiber.
 class Connection : public util::Connection {
  public:
   Connection(Protocol protocol, util::HttpListenerBase* http_listener, SSL_CTX* ctx,
              ServiceInterface* service);
   ~Connection();
 
-  using error_code = std::error_code;
+  using BreakerCb = std::function<void(uint32_t)>;
   using ShutdownCb = std::function<void()>;
   using ShutdownHandle = unsigned;
 
-  ShutdownHandle RegisterShutdownHook(ShutdownCb cb);
-  void UnregisterShutdownHook(ShutdownHandle id);
-
-  Protocol protocol() const {
-    return protocol_;
-  }
-
-  using BreakerCb = std::function<void(uint32_t)>;
-  void RegisterOnBreak(BreakerCb breaker_cb);
-
-  // This interface is used to pass a published message directly to the socket without
-  // copying strings.
-  // Once the msg is sent "bc" will be decreased so that caller could release the underlying
-  // storage for the message.
-  // virtual - to allow the testing code to override it.
-
+  // PubSub message, either incoming message for active subscription or reply for new subscription.
   struct PubMessage {
-    enum Type { kSubscribe, kUnsubscribe, kPublish } type;
+    // Represents incoming message.
+    struct MessageData {
+      std::string pattern{};            // non-empty for pattern subscriber
+      std::shared_ptr<char[]> buf;      // stores channel name and message
+      size_t channel_len, message_len;  // lengths in buf
 
-    std::string pattern{};  // if empty - means its a regular message, otherwise it's pmessage.
-    std::shared_ptr<std::string> channel{};
-    std::shared_ptr<std::string> message{};  // ensure that this message would out live passing
-                                             // between different threads/fibers
-    uint32_t channel_cnt = 0;                // relevant only for kSubscribe and kUnsubscribe
+      std::string_view Channel() const;
+      std::string_view Message() const;
+    };
 
-    PubMessage(bool add, std::shared_ptr<std::string> channel, uint32_t channel_cnt);
-    PubMessage(std::string pattern, std::shared_ptr<std::string> channel,
-               std::shared_ptr<std::string> message);
+    // Represents reply for subscribe/unsubscribe.
+    struct SubscribeData {
+      bool add;
+      std::string channel;
+      uint32_t channel_cnt;
+    };
 
-    PubMessage(const PubMessage&) = delete;
-    PubMessage& operator=(const PubMessage&) = delete;
-    PubMessage(PubMessage&&) = default;
+    std::variant<MessageData, SubscribeData> data;
+
+    PubMessage(bool add, std::string_view channel, uint32_t channel_cnt);
+    PubMessage(std::string pattern, std::shared_ptr<char[]> buf, size_t channel_len,
+               size_t message_len);
   };
 
-  // this function is overriden at test_utils TestConnection
-  virtual void SendMsgVecAsync(PubMessage pub_msg);
+  struct MonitorMessage : public std::string {};
 
-  // Note that this is accepted by value because the message is processed asynchronously.
-  void SendMonitorMsg(std::string monitor_msg);
+  struct PipelineMessage {
+    PipelineMessage(size_t nargs, size_t capacity) : args(nargs), storage(capacity) {
+    }
 
-  void SetName(std::string_view name) {
-    CopyCharBuf(name, sizeof(name_), name_);
-  }
+    void Reset(size_t nargs, size_t capacity);
 
-  const char* GetName() const {
-    return name_;
-  }
+    void SetArgs(const RespVec& args);
 
-  void SetPhase(std::string_view phase) {
-    CopyCharBuf(phase, sizeof(phase_), phase_);
-  }
+    size_t StorageCapacity() const;
+
+    // mi_stl_allocator uses mi heap internally.
+    // The capacity is chosen so that we allocate a fully utilized (256 bytes) block.
+    using StorageType = absl::InlinedVector<char, kReqStorageSize, mi_stl_allocator<char>>;
+
+    absl::InlinedVector<MutableSlice, 6> args;
+    StorageType storage;
+  };
+
+  struct MessageDeleter {
+    void operator()(PipelineMessage* msg) const;
+    void operator()(PubMessage* msg) const;
+  };
+
+  // Requests are allocated on the mimalloc heap and thus require a custom deleter.
+  using PipelineMessagePtr = std::unique_ptr<PipelineMessage, MessageDeleter>;
+  using PubMessagePtr = std::unique_ptr<PubMessage, MessageDeleter>;
+
+  struct MessageHandle {
+    size_t StorageCapacity() const;
+
+    bool IsPipelineMsg() const;
+
+    std::variant<MonitorMessage, PubMessagePtr, PipelineMessagePtr> handle;
+  };
+
+  enum Phase { READ_SOCKET, PROCESS };
+
+ public:
+  // Add PubMessage to dispatch queue.
+  // Virtual because behaviour is overwritten in test_utils.
+  virtual void SendPubMessageAsync(PubMessage);
+
+  // Add monitor message to dispatch queue.
+  void SendMonitorMessageAsync(std::string);
+
+  // Register hook that is executed on connection shutdown.
+  ShutdownHandle RegisterShutdownHook(ShutdownCb cb);
+
+  void UnregisterShutdownHook(ShutdownHandle id);
+
+  // Register hook that is executen when the connection breaks.
+  void RegisterBreakHook(BreakerCb breaker_cb);
+
+  // Manually shutdown self.
+  void ShutdownSelf();
+
+  static void ShutdownThreadLocal();
 
   std::string GetClientInfo(unsigned thread_id) const;
   std::string RemoteEndpointStr() const;
@@ -106,9 +152,17 @@ class Connection : public util::Connection {
   std::string LocalBindAddress() const;
   uint32_t GetClientId() const;
 
-  void ShutdownSelf();
+  Protocol protocol() const {
+    return protocol_;
+  }
 
-  static void ShutdownThreadLocal();
+  void SetName(std::string name) {
+    name_ = name;
+  }
+
+  std::string_view GetName() const {
+    return name_;
+  }
 
  protected:
   void OnShutdown() override;
@@ -118,68 +172,81 @@ class Connection : public util::Connection {
  private:
   enum ParserStatus { OK, NEED_MORE, ERROR };
 
+  struct DispatchOperations;
+  struct DispatchCleanup;
+  struct Shutdown;
+
+ private:
+  // Check protocol and handle connection.
   void HandleRequests() final;
 
-  static void CopyCharBuf(std::string_view src, unsigned dest_len, char* dest) {
-    src = src.substr(0, dest_len - 1);
-    if (!src.empty())
-      memcpy(dest, src.data(), src.size());
-    dest[src.size()] = '\0';
-  }
-
-  //
-  io::Result<bool> CheckForHttpProto(util::FiberSocketBase* peer);
-
+  // Start dispatch fiber and run IoLoop.
   void ConnectionFlow(util::FiberSocketBase* peer);
+
+  // Main loop reading client messages and passing requests to dispatch queue.
   std::variant<std::error_code, ParserStatus> IoLoop(util::FiberSocketBase* peer);
 
+  // Returns true if HTTP header is detected.
+  io::Result<bool> CheckForHttpProto(util::FiberSocketBase* peer);
+
+  // Handles events from dispatch queue.
   void DispatchFiber(util::FiberSocketBase* peer);
+
+  void SendAsync(MessageHandle msg);
+
+  // Create new pipeline request, re-use from pool when possible.
+  PipelineMessagePtr FromArgs(RespVec args, mi_heap_t* heap);
 
   ParserStatus ParseRedis();
   ParserStatus ParseMemcache();
+
   void OnBreakCb(int32_t mask);
 
-  base::IoBuf io_buf_;
+  // Shrink pipeline pool by a little while handling regular commands.
+  void ShrinkPipelinePool();
+
+  // Returns non-null request ptr if pool has vacant entries.
+  PipelineMessagePtr GetFromPipelinePool();
+
+ private:
+  std::deque<MessageHandle> dispatch_q_;  // dispatch queue
+  dfly::EventCount evc_;                  // dispatch queue waker
+
+  base::IoBuf io_buf_;  // used in io loop and parsers
   std::unique_ptr<RedisParser> redis_parser_;
   std::unique_ptr<MemcacheParser> memcache_parser_;
+
+  uint32_t id_;
+  Protocol protocol_;
+  ConnectionStats* stats_ = nullptr;
+
   util::HttpListenerBase* http_listener_;
   SSL_CTX* ctx_;
+
   ServiceInterface* service_;
+
   time_t creation_time_, last_interaction_;
-  char name_[16];
-  char phase_[16];
+
+  Phase phase_;
+  std::string name_;
 
   std::unique_ptr<ConnectionContext> cc_;
 
-  class Request;
-  struct DispatchOperations;
-  struct DispatchCleanup;
-  struct RequestDeleter;
-
-  using RequestPtr = std::unique_ptr<Request, RequestDeleter>;
-
-  // args are passed deliberately by value - to pass the ownership.
-  RequestPtr FromArgs(RespVec args, mi_heap_t* heap);
-
-  std::deque<RequestPtr> dispatch_q_;  // coordinated via evc_.
+  unsigned parser_error_ = 0;
   uint32_t pipeline_msg_cnt_ = 0;
 
-  static thread_local std::vector<RequestPtr> free_req_pool_;
-  dfly::EventCount evc_;
-
-  RespVec parse_args_;
-  CmdArgVec cmd_vec_;
-
-  unsigned parser_error_ = 0;
-  uint32_t id_;
   uint32_t break_poll_id_ = UINT32_MAX;
-  ConnectionStats* stats_ = nullptr;
 
-  Protocol protocol_;
-
-  struct Shutdown;
-  std::unique_ptr<Shutdown> shutdown_;
   BreakerCb breaker_cb_;
+  std::unique_ptr<Shutdown> shutdown_cb_;
+
+  RespVec tmp_parse_args_;
+  CmdArgVec tmp_cmd_vec_;
+
+  // Pooled pipieline messages per-thread.
+  // Aggregated while handling pipelines,
+  // graudally released while handling regular commands.
+  static thread_local std::vector<PipelineMessagePtr> pipeline_req_pool_;
 };
 
 void RespToArgList(const RespVec& src, CmdArgVec* dest);

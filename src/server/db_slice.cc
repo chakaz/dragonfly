@@ -208,7 +208,7 @@ DbStats& DbStats::operator+=(const DbStats& o) {
 }
 
 SliceEvents& SliceEvents::operator+=(const SliceEvents& o) {
-  static_assert(sizeof(SliceEvents) == 72, "You should update this function with new fields");
+  static_assert(sizeof(SliceEvents) == 80, "You should update this function with new fields");
 
   ADD(evicted_keys);
   ADD(hard_evictions);
@@ -219,6 +219,7 @@ SliceEvents& SliceEvents::operator+=(const SliceEvents& o) {
   ADD(garbage_checked);
   ADD(hits);
   ADD(misses);
+  ADD(insertion_rejections);
 
   return *this;
 }
@@ -309,6 +310,7 @@ pair<PrimeIterator, ExpireIterator> DbSlice::FindExt(const Context& cntx, string
   if (caching_mode_ && IsValid(res.first)) {
     if (!change_cb_.empty()) {
       auto bump_cb = [&](PrimeTable::bucket_iterator bit) {
+        DVLOG(2) << "Running callbacks for key " << key << " in dbid " << cntx.db_index;
         for (const auto& ccb : change_cb_) {
           ccb.second(cntx.db_index, bit);
         }
@@ -362,6 +364,7 @@ tuple<PrimeIterator, ExpireIterator, bool> DbSlice::AddOrFind2(const Context& cn
       return tuple_cat(res, make_tuple(false));
     }
     // It's a new entry.
+    DVLOG(2) << "Running callbacks for key " << key << " in dbid " << cntx.db_index;
     for (const auto& ccb : change_cb_) {
       ccb.second(cntx.db_index, key);
     }
@@ -372,6 +375,8 @@ tuple<PrimeIterator, ExpireIterator, bool> DbSlice::AddOrFind2(const Context& cn
 
   // If we are over limit in non-cache scenario, just be conservative and throw.
   if (!caching_mode_ && evp.mem_budget() < 0) {
+    VLOG(1) << "AddOrFind2: over limit, budget: " << evp.mem_budget();
+    events_.insertion_rejections++;
     throw bad_alloc();
   }
 
@@ -385,6 +390,9 @@ tuple<PrimeIterator, ExpireIterator, bool> DbSlice::AddOrFind2(const Context& cn
   try {
     tie(it, inserted) = db.prime.Insert(std::move(co_key), PrimeValue{}, evp);
   } catch (bad_alloc& e) {
+    VLOG(1) << "AddOrFind2: bad alloc exception, budget: " << evp.mem_budget();
+    events_.insertion_rejections++;
+
     throw e;
   }
 
@@ -668,6 +676,9 @@ size_t DbSlice::DbSize(DbIndex db_ind) const {
 }
 
 bool DbSlice::Acquire(IntentLock::Mode mode, const KeyLockArgs& lock_args) {
+  if (lock_args.args.empty()) {
+    return true;
+  }
   DCHECK_GT(lock_args.key_step, 0u);
 
   auto& lt = db_arr_[lock_args.db_index]->trans_locks;
@@ -694,6 +705,9 @@ bool DbSlice::Acquire(IntentLock::Mode mode, const KeyLockArgs& lock_args) {
 }
 
 void DbSlice::Release(IntentLock::Mode mode, const KeyLockArgs& lock_args) {
+  if (lock_args.args.empty()) {
+    return;
+  }
   DVLOG(2) << "Release " << IntentLock::ModeName(mode) << " for " << lock_args.args[0];
   if (lock_args.args.size() == 1) {
     Release(mode, lock_args.db_index, lock_args.args.front(), 1);
@@ -723,7 +737,6 @@ bool DbSlice::CheckLock(IntentLock::Mode mode, DbIndex dbid, string_view key) co
 }
 
 bool DbSlice::CheckLock(IntentLock::Mode mode, const KeyLockArgs& lock_args) const {
-  DCHECK(!lock_args.args.empty());
   const auto& lt = db_arr_[lock_args.db_index]->trans_locks;
   for (size_t i = 0; i < lock_args.args.size(); i += lock_args.key_step) {
     auto s = lock_args.args[i];
@@ -737,6 +750,7 @@ bool DbSlice::CheckLock(IntentLock::Mode mode, const KeyLockArgs& lock_args) con
 
 void DbSlice::PreUpdate(DbIndex db_ind, PrimeIterator it) {
   FiberAtomicGuard fg;
+  DVLOG(2) << "Running callbacks in dbid " << db_ind;
   for (const auto& ccb : change_cb_) {
     ccb.second(db_ind, ChangeReq{it});
   }
@@ -851,14 +865,16 @@ void DbSlice::FlushChangeToEarlierCallbacks(DbIndex db_ind, PrimeIterator it,
                                             uint64_t upper_bound) {
   FiberAtomicGuard fg;
   uint64_t bucket_version = it.GetVersion();
-  // change_cb_ is ordered by vesion.
+  // change_cb_ is ordered by version.
+  DVLOG(2) << "Running callbacks in dbid " << db_ind << " with bucket_version=" << bucket_version
+           << ", upper_bound=" << upper_bound;
   for (const auto& ccb : change_cb_) {
-    uint64_t cb_vesrion = ccb.first;
-    DCHECK_LE(cb_vesrion, upper_bound);
-    if (cb_vesrion == upper_bound) {
+    uint64_t cb_version = ccb.first;
+    DCHECK_LE(cb_version, upper_bound);
+    if (cb_version == upper_bound) {
       return;
     }
-    if (bucket_version < cb_vesrion) {
+    if (bucket_version < cb_version) {
       ccb.second(db_ind, ChangeReq{it});
     }
   }

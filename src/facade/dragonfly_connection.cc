@@ -78,24 +78,11 @@ bool MatchHttp11Line(string_view line) {
 constexpr size_t kMinReadSize = 256;
 constexpr size_t kMaxReadSize = 32_KB;
 
-struct PubMsgRecord {
-  Connection::PubMessage pub_msg;
-
-  PubMsgRecord(Connection::PubMessage pmsg) : pub_msg(move(pmsg)) {
-  }
-};
-
-#ifdef ABSL_HAVE_ADDRESS_SANITIZER
-constexpr size_t kReqStorageSize = 88;
-#else
-constexpr size_t kReqStorageSize = 120;
-#endif
-
 thread_local uint32_t free_req_release_weight = 0;
 
 }  // namespace
 
-thread_local vector<Connection::RequestPtr> Connection::free_req_pool_;
+thread_local vector<Connection::PipelineMessagePtr> Connection::pipeline_req_pool_;
 
 struct Connection::Shutdown {
   absl::flat_hash_map<ShutdownHandle, ShutdownCb> map;
@@ -111,74 +98,21 @@ struct Connection::Shutdown {
   }
 };
 
-// Used as custom deleter for Request object
-struct Connection::RequestDeleter {
-  void operator()(Request* req) const;
-};
-
-// Please note: The call to the Dtor is mandatory for this!!
-// This class contain types that don't have trivial destructed objects
-class Connection::Request {
- public:
-  using MonitorMessage = std::string;
-
-  struct PipelineMsg {
-    // I do not use mi_heap_t explicitly but mi_stl_allocator at the end does the same job
-    // of using the thread's heap.
-    // The capacity is chosen so that we allocate a fully utilized (256 bytes) block.
-    using StorageType = absl::InlinedVector<char, kReqStorageSize, mi_stl_allocator<char>>;
-
-    PipelineMsg(size_t nargs, size_t capacity) : args(nargs), storage(capacity) {
-    }
-
-    void Reset(size_t nargs, size_t capacity);
-
-    absl::InlinedVector<MutableSlice, 6> args;
-    StorageType storage;
-  };
-
-  using MessagePayload = std::variant<PipelineMsg, PubMsgRecord, MonitorMessage>;
-
-  // Overload to create the a new pipeline message
-  static RequestPtr New(mi_heap_t* heap, const RespVec& args, size_t capacity);
-
-  // Overload to create a new pubsub message
-  static RequestPtr New(PubMessage pub_msg);
-
-  // Overload to create a new the monitor message
-  static RequestPtr New(MonitorMessage msg);
-
-  void Emplace(const RespVec& args, size_t capacity);
-
-  MessagePayload payload;
-
-  size_t StorageCapacity() const;
-
-  bool IsPipelineMsg() const;
-
- private:
-  static constexpr size_t kSizeOfPipelineMsg = sizeof(PipelineMsg);
-
-  Request(size_t nargs, size_t capacity) : payload(PipelineMsg{nargs, capacity}) {
-  }
-
-  Request(PubMsgRecord msg) : payload(std::move(msg)) {
-  }
-
-  Request(MonitorMessage msg) : payload(std::move(msg)) {
-  }
-
-  Request(const Request&) = delete;
-  void SetArgs(const RespVec& args);
-};
-
-Connection::PubMessage::PubMessage(string pattern, shared_ptr<string> channel,
-                                   shared_ptr<string> message)
-    : type{kPublish}, pattern{move(pattern)}, channel{move(channel)}, message{move(message)} {
+Connection::PubMessage::PubMessage(string pattern, shared_ptr<char[]> buf, size_t channel_len,
+                                   size_t message_len)
+    : data{MessageData{pattern, move(buf), channel_len, message_len}} {
 }
 
-Connection::PubMessage::PubMessage(bool add, shared_ptr<string> channel, uint32_t channel_cnt)
-    : type{add ? kSubscribe : kUnsubscribe}, channel{move(channel)}, channel_cnt{channel_cnt} {
+Connection::PubMessage::PubMessage(bool add, string_view channel, uint32_t channel_cnt)
+    : data{SubscribeData{add, string{channel}, channel_cnt}} {
+}
+
+string_view Connection::PubMessage::MessageData::Channel() const {
+  return {buf.get(), channel_len};
+}
+
+string_view Connection::PubMessage::MessageData::Message() const {
+  return {buf.get() + channel_len, message_len};
 }
 
 struct Connection::DispatchOperations {
@@ -186,130 +120,103 @@ struct Connection::DispatchOperations {
       : stats{me->service_->GetThreadLocalConnectionStats()}, builder{b}, self(me) {
   }
 
-  void operator()(const PubMsgRecord& msg);
-  void operator()(Request::PipelineMsg& msg);
-  void operator()(const Request::MonitorMessage& msg);
+  void operator()(const PubMessage& msg);
+  void operator()(Connection::PipelineMessage& msg);
+  void operator()(const MonitorMessage& msg);
+
+  template <typename T, typename D> void operator()(unique_ptr<T, D>& ptr) {
+    operator()(*ptr.get());
+  }
 
   ConnectionStats* stats = nullptr;
   SinkReplyBuilder* builder = nullptr;
   Connection* self = nullptr;
 };
 
-Connection::RequestPtr Connection::Request::New(std::string msg) {
-  void* ptr = mi_malloc(sizeof(Request));
-  Request* req = new (ptr) Request(std::move(msg));
-  return Connection::RequestPtr{req, Connection::RequestDeleter{}};
-}
-
-Connection::RequestPtr Connection::Request::New(mi_heap_t* heap, const RespVec& args,
-                                                size_t capacity) {
-  constexpr auto kReqSz = sizeof(Request);
-  void* ptr = mi_heap_malloc_small(heap, kReqSz);
-
-  // We must construct in place here, since there is a slice that uses memory locations
-  Request* req = new (ptr) Request(args.size(), capacity);
-  req->SetArgs(args);
-
-  return Connection::RequestPtr{req, Connection::RequestDeleter{}};
-}
-
-void Connection::Request::SetArgs(const RespVec& args) {
-  // At this point we know that we have PipelineMsg in Request so next op is safe.
-  PipelineMsg& pipeline_msg = std::get<PipelineMsg>(payload);
-  auto* next = pipeline_msg.storage.data();
+void Connection::PipelineMessage::SetArgs(const RespVec& args) {
+  auto* next = storage.data();
   for (size_t i = 0; i < args.size(); ++i) {
     auto buf = args[i].GetBuf();
     size_t s = buf.size();
     memcpy(next, buf.data(), s);
-    pipeline_msg.args[i] = MutableSlice(next, s);
+    this->args[i] = MutableSlice(next, s);
     next += s;
   }
 }
 
-Connection::RequestPtr Connection::Request::New(PubMessage pub_msg) {
-  // This will generate a new request for pubsub message
-  // Please note that unlike the above case, we don't need to "protect", the internals here
-  // since we are currently using a borrow token for it - i.e. the BlockingCounter will
-  // ensure that the message is not deleted until we are finish sending it at the other
-  // side of the queue
-  PubMsgRecord new_msg{move(pub_msg)};
-  void* ptr = mi_malloc(sizeof(Request));
-  Request* req = new (ptr) Request(std::move(new_msg));
-  return Connection::RequestPtr{req, Connection::RequestDeleter{}};
+void Connection::MessageDeleter::operator()(PipelineMessage* msg) const {
+  msg->~PipelineMessage();
+  mi_free(msg);
 }
 
-void Connection::RequestDeleter::operator()(Request* req) const {
-  req->~Request();
-  mi_free(req);
+void Connection::MessageDeleter::operator()(PubMessage* msg) const {
+  msg->~PubMessage();
+  mi_free(msg);
 }
 
-void Connection::Request::Emplace(const RespVec& args, size_t capacity) {
-  PipelineMsg* msg = get_if<PipelineMsg>(&payload);
-  if (msg) {
-    msg->Reset(args.size(), capacity);
-  } else {
-    payload = PipelineMsg{args.size(), capacity};
-  }
-  SetArgs(args);
-}
-
-void Connection::Request::PipelineMsg::Reset(size_t nargs, size_t capacity) {
+void Connection::PipelineMessage::Reset(size_t nargs, size_t capacity) {
   storage.resize(capacity);
   args.resize(nargs);
 }
 
-template <class... Ts> struct Overloaded : Ts... { using Ts::operator()...; };
+size_t Connection::PipelineMessage::StorageCapacity() const {
+  return storage.capacity() + args.capacity();
+}
+
+template <class... Ts> struct Overloaded : Ts... {
+  using Ts::operator()...;
+
+  template <typename T, typename D> size_t operator()(const unique_ptr<T, D>& ptr) {
+    return operator()(*ptr.get());
+  }
+};
+
 template <class... Ts> Overloaded(Ts...) -> Overloaded<Ts...>;
 
-size_t Connection::Request::StorageCapacity() const {
-  return std::visit(Overloaded{[](const PubMsgRecord& msg) -> size_t { return 0; },
-                               [](const PipelineMsg& arg) -> size_t {
-                                 return arg.storage.capacity() + arg.args.capacity();
-                               },
-                               [](const MonitorMessage& arg) -> size_t { return arg.capacity(); }},
-                    payload);
+size_t Connection::MessageHandle::StorageCapacity() const {
+  auto pub_size = [](const PubMessage& msg) -> size_t { return 0; };
+  auto msg_size = [](const PipelineMessage& arg) -> size_t { return arg.StorageCapacity(); };
+  auto monitor_size = [](const MonitorMessage& arg) -> size_t { return 0; };
+  return visit(Overloaded{pub_size, msg_size, monitor_size}, this->handle);
 }
 
-bool Connection::Request::IsPipelineMsg() const {
-  return std::get_if<PipelineMsg>(&payload) != nullptr;
+bool Connection::MessageHandle::IsPipelineMsg() const {
+  return get_if<PipelineMessagePtr>(&this->handle) != nullptr;
 }
 
-void Connection::DispatchOperations::operator()(const Request::MonitorMessage& msg) {
+void Connection::DispatchOperations::operator()(const MonitorMessage& msg) {
   RedisReplyBuilder* rbuilder = (RedisReplyBuilder*)builder;
   rbuilder->SendSimpleString(msg);
 }
 
-void Connection::DispatchOperations::operator()(const PubMsgRecord& msg) {
+void Connection::DispatchOperations::operator()(const PubMessage& pub_msg) {
   RedisReplyBuilder* rbuilder = (RedisReplyBuilder*)builder;
   ++stats->async_writes_cnt;
-  const PubMessage& pub_msg = msg.pub_msg;
-  string_view arr[4];
-  if (pub_msg.type == PubMessage::kPublish) {
-    if (pub_msg.pattern.empty()) {
-      DVLOG(1) << "Sending message, from channel: " << *pub_msg.channel << " " << *pub_msg.message;
-      arr[0] = "message";
-      arr[1] = *pub_msg.channel;
-      arr[2] = *pub_msg.message;
-      rbuilder->SendStringArr(absl::Span<string_view>{arr, 3},
-                              RedisReplyBuilder::CollectionType::PUSH);
+  auto send_msg = [rbuilder](const PubMessage::MessageData& data) {
+    unsigned i = 0;
+    string_view arr[4];
+    if (data.pattern.empty()) {
+      arr[i++] = "message";
     } else {
-      arr[0] = "pmessage";
-      arr[1] = pub_msg.pattern;
-      arr[2] = *pub_msg.channel;
-      arr[3] = *pub_msg.message;
-      rbuilder->SendStringArr(absl::Span<string_view>{arr, 4},
-                              RedisReplyBuilder::CollectionType::PUSH);
+      arr[i++] = "pmessage";
+      arr[i++] = data.pattern;
     }
-  } else {
+    arr[i++] = data.Channel();
+    arr[i++] = data.Message();
+    rbuilder->SendStringArr(absl::Span<string_view>{arr, i},
+                            RedisReplyBuilder::CollectionType::PUSH);
+  };
+  auto send_sub = [rbuilder](const PubMessage::SubscribeData& data) {
     const char* action[2] = {"unsubscribe", "subscribe"};
     rbuilder->StartCollection(3, RedisReplyBuilder::CollectionType::PUSH);
-    rbuilder->SendBulkString(action[pub_msg.type == PubMessage::kSubscribe]);
-    rbuilder->SendBulkString(*pub_msg.channel);
-    rbuilder->SendLong(pub_msg.channel_cnt);
-  }
+    rbuilder->SendBulkString(action[data.add]);
+    rbuilder->SendBulkString(data.channel);
+    rbuilder->SendLong(data.channel_cnt);
+  };
+  visit(Overloaded{send_msg, send_sub}, pub_msg.data);
 }
 
-void Connection::DispatchOperations::operator()(Request::PipelineMsg& msg) {
+void Connection::DispatchOperations::operator()(Connection::PipelineMessage& msg) {
   ++stats->pipelined_cmd_cnt;
   self->pipeline_msg_cnt_--;
 
@@ -325,12 +232,12 @@ void Connection::DispatchOperations::operator()(Request::PipelineMsg& msg) {
 
 Connection::Connection(Protocol protocol, util::HttpListenerBase* http_listener, SSL_CTX* ctx,
                        ServiceInterface* service)
-    : io_buf_(kMinReadSize), http_listener_(http_listener), ctx_(ctx), service_(service) {
+    : io_buf_(kMinReadSize), http_listener_(http_listener), ctx_(ctx), service_(service), name_{} {
   static atomic_uint32_t next_id{1};
 
   protocol_ = protocol;
 
-  constexpr size_t kReqSz = sizeof(Connection::Request);
+  constexpr size_t kReqSz = sizeof(Connection::PipelineMessage);
   static_assert(kReqSz <= 256 && kReqSz >= 232);
 
   switch (protocol) {
@@ -344,8 +251,6 @@ Connection::Connection(Protocol protocol, util::HttpListenerBase* http_listener,
 
   creation_time_ = time(nullptr);
   last_interaction_ = creation_time_;
-  memset(name_, 0, sizeof(name_));
-  memset(phase_, 0, sizeof(phase_));
   id_ = next_id.fetch_add(1, memory_order_relaxed);
 }
 
@@ -356,8 +261,8 @@ Connection::~Connection() {
 void Connection::OnShutdown() {
   VLOG(1) << "Connection::OnShutdown";
 
-  if (shutdown_) {
-    for (const auto& k_v : shutdown_->map) {
+  if (shutdown_cb_) {
+    for (const auto& k_v : shutdown_cb_->map) {
       k_v.second();
     }
   }
@@ -384,17 +289,17 @@ void Connection::OnPostMigrateThread() {
 }
 
 auto Connection::RegisterShutdownHook(ShutdownCb cb) -> ShutdownHandle {
-  if (!shutdown_) {
-    shutdown_ = make_unique<Shutdown>();
+  if (!shutdown_cb_) {
+    shutdown_cb_ = make_unique<Shutdown>();
   }
-  return shutdown_->Add(std::move(cb));
+  return shutdown_cb_->Add(std::move(cb));
 }
 
 void Connection::UnregisterShutdownHook(ShutdownHandle id) {
-  if (shutdown_) {
-    shutdown_->Remove(id);
-    if (shutdown_->map.empty())
-      shutdown_.reset();
+  if (shutdown_cb_) {
+    shutdown_cb_->Remove(id);
+    if (shutdown_cb_->map.empty())
+      shutdown_cb_.reset();
   }
 }
 
@@ -465,22 +370,8 @@ void Connection::HandleRequests() {
   VLOG(1) << "Closed connection for peer " << remote_ep;
 }
 
-void Connection::RegisterOnBreak(BreakerCb breaker_cb) {
+void Connection::RegisterBreakHook(BreakerCb breaker_cb) {
   breaker_cb_ = breaker_cb;
-}
-
-void Connection::SendMsgVecAsync(PubMessage pub_msg) {
-  DCHECK(cc_);
-
-  if (cc_->conn_closing) {
-    return;
-  }
-
-  RequestPtr req = Request::New(move(pub_msg));
-  dispatch_q_.push_back(std::move(req));
-  if (dispatch_q_.size() == 1) {
-    evc_.notify();
-  }
 }
 
 std::string Connection::LocalBindAddress() const {
@@ -502,12 +393,15 @@ string Connection::GetClientInfo(unsigned thread_id) const {
   getsockopt(lsb->native_handle(), SOL_SOCKET, SO_INCOMING_CPU, &cpu, &len);
   int my_cpu_id = sched_getcpu();
 
+  static constexpr string_view PHASE_NAMES[] = {"readsock", "process"};
+  static_assert(PHASE_NAMES[PROCESS] == "process");
+
   absl::StrAppend(&res, "id=", id_, " addr=", re.address().to_string(), ":", re.port());
   absl::StrAppend(&res, " laddr=", le.address().to_string(), ":", le.port());
   absl::StrAppend(&res, " fd=", lsb->native_handle(), " name=", name_);
   absl::StrAppend(&res, " tid=", thread_id, " irqmatch=", int(cpu == my_cpu_id));
   absl::StrAppend(&res, " age=", now - creation_time_, " idle=", now - last_interaction_);
-  absl::StrAppend(&res, " phase=", phase_);
+  absl::StrAppend(&res, " phase=", PHASE_NAMES[phase_]);
 
   if (cc_) {
     string cc_info = service_->GetContextInfo(cc_.get());
@@ -575,7 +469,7 @@ void Connection::ConnectionFlow(FiberSocketBase* peer) {
   // At the start we read from the socket to determine the HTTP/Memstore protocol.
   // Therefore we may already have some data in the buffer.
   if (io_buf_.InputLen() > 0) {
-    SetPhase("process");
+    phase_ = PROCESS;
     if (redis_parser_) {
       parse_status = ParseRedis();
     } else {
@@ -647,10 +541,10 @@ auto Connection::ParseRedis() -> ParserStatus {
   mi_heap_t* tlh = mi_heap_get_backing();
 
   do {
-    result = redis_parser_->Parse(io_buf_.InputBuffer(), &consumed, &parse_args_);
+    result = redis_parser_->Parse(io_buf_.InputBuffer(), &consumed, &tmp_parse_args_);
 
-    if (result == RedisParser::OK && !parse_args_.empty()) {
-      RespExpr& first = parse_args_.front();
+    if (result == RedisParser::OK && !tmp_parse_args_.empty()) {
+      RespExpr& first = tmp_parse_args_.front();
       if (first.type == RespExpr::STRING) {
         DVLOG(2) << "Got Args with first token " << ToSV(first.GetBuf());
       }
@@ -662,35 +556,21 @@ auto Connection::ParseRedis() -> ParserStatus {
       bool is_sync_dispatch = !cc_->async_dispatch && !cc_->force_dispatch;
       if (dispatch_q_.empty() && is_sync_dispatch && consumed >= io_buf_.InputLen()) {
         // Gradually release the request pool.
-        // The request pool is shared by all the connections in the thread so we do not want
-        // to release it aggressively just because some connection is running in
-        // non-pipelined mode. So we wait at least N times,
-        // where N is the number of connections in the thread.
-        if (!free_req_pool_.empty()) {
-          ++free_req_release_weight;
-          if (free_req_release_weight > stats_->num_conns) {
-            free_req_release_weight = 0;
-            stats_->pipeline_cache_capacity -= free_req_pool_.back()->StorageCapacity();
-            free_req_pool_.pop_back();
-          }
-        }
-        RespToArgList(parse_args_, &cmd_vec_);
+        ShrinkPipelinePool();
 
-        DVLOG(2) << "Sync dispatch " << ToSV(cmd_vec_.front());
+        RespToArgList(tmp_parse_args_, &tmp_cmd_vec_);
 
-        CmdArgList cmd_list{cmd_vec_.data(), cmd_vec_.size()};
+        DVLOG(2) << "Sync dispatch " << ToSV(tmp_cmd_vec_.front());
+
+        CmdArgList cmd_list{tmp_cmd_vec_.data(), tmp_cmd_vec_.size()};
         service_->DispatchCommand(cmd_list, cc_.get());
         last_interaction_ = time(nullptr);
       } else {
         // Dispatch via queue to speedup input reading.
-        RequestPtr req = FromArgs(std::move(parse_args_), tlh);
+        SendAsync(MessageHandle{FromArgs(move(tmp_parse_args_), tlh)});
         ++pipeline_msg_cnt_;
-        dispatch_q_.push_back(std::move(req));
-        if (dispatch_q_.size() == 1) {
-          evc_.notify();
-        } else if (dispatch_q_.size() > 10) {
+        if (dispatch_q_.size() > 10)
           ThisFiber::Yield();
-        }
       }
     }
     io_buf_.ConsumeInput(consumed);
@@ -783,7 +663,7 @@ auto Connection::IoLoop(util::FiberSocketBase* peer) -> variant<error_code, Pars
     FetchBuilderStats(stats_, builder);
 
     io::MutableBytes append_buf = io_buf_.AppendBuffer();
-    SetPhase("readsock");
+    phase_ = READ_SOCKET;
 
     ::io::Result<size_t> recv_sz = peer->Recv(append_buf);
     last_interaction_ = time(nullptr);
@@ -797,7 +677,7 @@ auto Connection::IoLoop(util::FiberSocketBase* peer) -> variant<error_code, Pars
     io_buf_.CommitWrite(*recv_sz);
     stats_->io_read_bytes += *recv_sz;
     ++stats_->io_read_cnt;
-    SetPhase("process");
+    phase_ = PROCESS;
 
     if (redis_parser_) {
       parse_status = ParseRedis();
@@ -858,13 +738,15 @@ void Connection::DispatchFiber(util::FiberSocketBase* peer) {
     if (cc_->conn_closing)
       break;
 
-    RequestPtr req{std::move(dispatch_q_.front())};
+    MessageHandle msg = move(dispatch_q_.front());
     dispatch_q_.pop_front();
-    std::visit(dispatch_op, req->payload);
+    std::visit(dispatch_op, msg.handle);
 
-    if (req->IsPipelineMsg() && stats_->pipeline_cache_capacity < request_cache_limit) {
-      stats_->pipeline_cache_capacity += req->StorageCapacity();
-      free_req_pool_.push_back(std::move(req));
+    if (auto* pipe = get_if<PipelineMessagePtr>(&msg.handle); pipe) {
+      if (stats_->pipeline_cache_capacity < request_cache_limit) {
+        stats_->pipeline_cache_capacity += (*pipe)->StorageCapacity();
+        pipeline_req_pool_.push_back(move(*pipe));
+      }
     }
   }
 
@@ -874,7 +756,7 @@ void Connection::DispatchFiber(util::FiberSocketBase* peer) {
   dispatch_q_.clear();
 }
 
-auto Connection::FromArgs(RespVec args, mi_heap_t* heap) -> RequestPtr {
+Connection::PipelineMessagePtr Connection::FromArgs(RespVec args, mi_heap_t* heap) {
   DCHECK(!args.empty());
   size_t backed_sz = 0;
   for (const auto& arg : args) {
@@ -883,23 +765,49 @@ auto Connection::FromArgs(RespVec args, mi_heap_t* heap) -> RequestPtr {
   }
   DCHECK(backed_sz);
 
-  constexpr auto kReqSz = sizeof(Request);
+  constexpr auto kReqSz = sizeof(PipelineMessage);
   static_assert(kReqSz < MI_SMALL_SIZE_MAX);
-  static_assert(alignof(Request) == 8);
+  static_assert(alignof(PipelineMessage) == 8);
 
-  RequestPtr req;
-
-  if (free_req_pool_.empty()) {
-    req = Request::New(heap, args, backed_sz);
+  PipelineMessagePtr ptr;
+  if (ptr = GetFromPipelinePool(); ptr) {
+    ptr->Reset(args.size(), backed_sz);
   } else {
-    free_req_release_weight = 0;  // Reset the release weight.
-    req = move(free_req_pool_.back());
-    stats_->pipeline_cache_capacity -= req->StorageCapacity();
-
-    free_req_pool_.pop_back();
-    req->Emplace(move(args), backed_sz);
+    void* heap_ptr = mi_heap_malloc_small(heap, sizeof(PipelineMessage));
+    // We must construct in place here, since there is a slice that uses memory locations
+    ptr.reset(new (heap_ptr) PipelineMessage(args.size(), backed_sz));
   }
-  return req;
+
+  ptr->SetArgs(args);
+  return ptr;
+}
+
+void Connection::ShrinkPipelinePool() {
+  if (pipeline_req_pool_.empty())
+    return;
+
+  // The request pool is shared by all the connections in the thread so we do not want
+  // to release it aggressively just because some connection is running in
+  // non-pipelined mode. So by using free_req_release_weight we wait at least N times,
+  // where N is the number of connections in the thread.
+  ++free_req_release_weight;
+
+  if (free_req_release_weight > stats_->num_conns) {
+    free_req_release_weight = 0;
+    stats_->pipeline_cache_capacity -= pipeline_req_pool_.back()->StorageCapacity();
+    pipeline_req_pool_.pop_back();
+  }
+}
+
+Connection::PipelineMessagePtr Connection::GetFromPipelinePool() {
+  if (pipeline_req_pool_.empty())
+    return nullptr;
+
+  free_req_release_weight = 0;  // Reset the release weight.
+  auto ptr = move(pipeline_req_pool_.back());
+  stats_->pipeline_cache_capacity -= ptr->StorageCapacity();
+  pipeline_req_pool_.pop_back();
+  return ptr;
 }
 
 void Connection::ShutdownSelf() {
@@ -907,7 +815,7 @@ void Connection::ShutdownSelf() {
 }
 
 void Connection::ShutdownThreadLocal() {
-  free_req_pool_.clear();
+  pipeline_req_pool_.clear();
 }
 
 void RespToArgList(const RespVec& src, CmdArgVec* dest) {
@@ -919,15 +827,24 @@ void RespToArgList(const RespVec& src, CmdArgVec* dest) {
   }
 }
 
-void Connection::SendMonitorMsg(std::string monitor_msg) {
+void Connection::SendPubMessageAsync(PubMessage msg) {
+  void* ptr = mi_malloc(sizeof(PubMessage));
+  SendAsync({PubMessagePtr{new (ptr) PubMessage{move(msg)}, MessageDeleter{}}});
+}
+
+void Connection::SendMonitorMessageAsync(string msg) {
+  SendAsync({MonitorMessage{move(msg)}});
+}
+
+void Connection::SendAsync(MessageHandle msg) {
   DCHECK(cc_);
 
-  if (!cc_->conn_closing) {
-    RequestPtr req = Request::New(std::move(monitor_msg));
-    dispatch_q_.push_back(std::move(req));
-    if (dispatch_q_.size() == 1) {
-      evc_.notify();
-    }
+  if (cc_->conn_closing)
+    return;
+
+  dispatch_q_.push_back(move(msg));
+  if (dispatch_q_.size() == 1) {
+    evc_.notify();
   }
 }
 

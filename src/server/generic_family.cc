@@ -723,8 +723,7 @@ void GenericFamily::Expire(CmdArgList args, ConnectionContext* cntx) {
   }
 
   if (int_arg > kMaxExpireDeadlineSec || int_arg < -kMaxExpireDeadlineSec) {
-    ToLower(&args[0]);
-    return (*cntx)->SendError(InvalidExpireTime(ArgS(args, 0)));
+    return (*cntx)->SendError(InvalidExpireTime(cntx->cid->name()));
   }
 
   int_arg = std::max(int_arg, -1L);
@@ -1442,7 +1441,7 @@ void GenericFamily::Register(CommandRegistry* registry) {
   constexpr auto kSelectOpts = CO::LOADING | CO::FAST | CO::NOSCRIPT;
 
   *registry << CI{"DEL", CO::WRITE, -2, 1, -1, 1}.HFUNC(Del)
-            /* Redis compaitibility:
+            /* Redis compatibility:
              * We don't allow PING during loading since in Redis PING is used as
              * failure detection, and a loading server is considered to be
              * not available. */

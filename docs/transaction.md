@@ -120,7 +120,7 @@ Redis transactions (MULTI/EXEC sequences) and commands produced by Lua scripts a
 
 The multi feature of the transactional framework allows running consecutive commands without rescheduling the transaction for each command as if they are part of one single transaction. This feature is transparent to the commands itself, so no changes are required for them to be used in a multi-transaction.
 
-There are four modes called "multi modes" in which a multi transaction can be executed, each with its own benefits and drawbacks.
+There are three modes called "multi modes" in which a multi transaction can be executed, each with its own benefits and drawbacks.
 
 __1. Global mode__
 
@@ -130,13 +130,25 @@ __2. Lock ahead mode__
 
 The transaction is equivalent to a regular transaction with multiple hops. It is scheduled on all keys used by the commands in the transaction block, or Lua script, and the commands are executed as a series of consecutive hops.
 
-__3. Incremental lock mode__
-
-The transaction schedules itself on all the shards that are accessed by the Redis transaction or Lua script, but does not lock any keys ahead. Only when it executes and occupies all the predetermined shards, it starts locking the keys it accesses. This mode _can_ be useful for delaying the acquisition of locks for contended keys and thus allowing other transactions to run in parallel for a longer period of time, however this mode disabled a wide range of optimizations for the multi-transaction itself, such as running out of order.
-
-__4. Non atomic mode__
+__3. Non atomic mode__
 
 All commands are executed as separate transactions making the multi-transaction not atomic. It vastly improves the throughput with contended keys, as locks are acquired only for single commands. This mode is useful for Lua scripts without atomicity requirements.
+
+## Multi-op command squashing
+
+There are two fundamental problems to executing a series of consecutive commands on Dragonfly:
+* each command invocation requires an expensive hop
+* executing commands sequentially makes no use of our multi-threaded architecture
+
+Luckily we can make one important observation about command sequences. Given a sequence of commands _where each command needs to access only a single shard_, we can conclude that as long as they are part of one atomic transaction:
+* each command needs to preserve its order only relative to other commands accessing the same shard
+* commands accessing different shards can run in parallel
+
+The basic idea behind command squashing is identifying consecutive series of single-shard commands and separating them by shards, while maintaing their relative order withing each shard. Once the commands are separated, we can execute a single hop on all relevant shards. Within each shard the hop callback will execute one by one only those commands, that assigned to its respective shard. Because all commands are already placed on their relevant threads, no further hops are required and all command callbacks are executed inline.
+
+Reviewing our initial problems, command squashing:
+* Allows executing many commands with only one hop
+* Allows executing commands in pararllel
 
 ## Optimizations
 Out of order transactions - TBD

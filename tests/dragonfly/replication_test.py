@@ -150,8 +150,7 @@ disconnect_cases = [
 async def test_disconnect_replica(df_local_factory: DflyInstanceFactory, df_seeder_factory, t_master, t_crash_fs, t_crash_ss, t_disonnect, n_keys):
     master = df_local_factory.create(port=BASE_PORT, proactor_threads=t_master)
     replicas = [
-        (df_local_factory.create(
-            port=BASE_PORT+i+1, proactor_threads=t), crash_fs)
+        (df_local_factory.create(port=BASE_PORT+i+1, proactor_threads=t), crash_fs)
         for i, (t, crash_fs) in enumerate(
             chain(
                 zip(t_crash_fs, repeat(DISCONNECT_CRASH_FULL_SYNC)),
@@ -286,8 +285,7 @@ master_crash_cases = [
 async def test_disconnect_master(df_local_factory, df_seeder_factory, t_master, t_replicas, n_random_crashes, n_keys):
     master = df_local_factory.create(port=1111, proactor_threads=t_master)
     replicas = [
-        df_local_factory.create(
-            port=BASE_PORT+i+1, proactor_threads=t)
+        df_local_factory.create(port=BASE_PORT+i+1, proactor_threads=t)
         for i, t in enumerate(t_replicas)
     ]
 
@@ -386,6 +384,54 @@ async def test_rotating_masters(df_local_factory, df_seeder_factory, t_replica, 
         fill_task.cancel()
 
 
+@pytest.mark.asyncio
+async def test_cancel_replication_immediately(df_local_factory, df_seeder_factory):
+    """
+    Issue 40 replication commands randomally distributed over 10 seconds. This
+    checks that the replication state machine can handle cancellation well.
+    We assert that at least one command was cancelled during start and at least
+    one command one successfull.
+    After we finish the 'fuzzing' part, replicate the first master and check that
+    all the data is correct.
+    """
+    COMMANDS_TO_ISSUE = 40
+
+    replica = df_local_factory.create(port=BASE_PORT)
+    masters = [df_local_factory.create(port=BASE_PORT+i+1) for i in range(4)]
+    seeders = [df_seeder_factory.create(port=m.port) for m in masters]
+
+    df_local_factory.start_all([replica] + masters)
+    c_replica = aioredis.Redis(port=replica.port)
+    await asyncio.gather(*(seeder.run(target_deviation=0.1) for seeder in seeders))
+
+    replication_commands = []
+
+    async def replicate(index):
+        await asyncio.sleep(10.0 * random.random())
+        try:
+            start = time.time()
+            await c_replica.execute_command(f"REPLICAOF localhost {masters[index].port}")
+            # Giving replication commands shouldn't hang.
+            assert time.time() - start < 2.0
+            return True
+        except aioredis.exceptions.ResponseError as e:
+            assert e.args[0] == "replication cancelled"
+            return False
+
+    for i in range(COMMANDS_TO_ISSUE):
+        index = random.choice(range(len(masters)))
+        replication_commands.append(replicate(index))
+    results = await asyncio.gather(*replication_commands)
+    num_successes = sum(results)
+    assert COMMANDS_TO_ISSUE > num_successes, "At least one REPLICAOF must be cancelled"
+    assert num_successes > 0, "At least one REPLICAOF must be succeed"
+
+    await c_replica.execute_command(f"REPLICAOF localhost {masters[0].port}")
+
+    capture = await seeders[0].capture()
+    assert await seeders[0].compare(capture, replica.port)
+
+
 """
 Test flushall command. Set data to master send flashall and set more data.
 Check replica keys at the end.
@@ -421,9 +467,8 @@ async def test_flushall(df_local_factory):
         n_keys, n_keys*2), batch_size=3)
 
     await pipe.execute()
-
-    # Wait for replica to receive them
-    await asyncio.sleep(1)
+    # Check replica finished executing the replicated commands
+    await check_all_replicas_finished([c_replica], c_master)
 
     # Check replica keys 0..n_keys-1 dont exist
     pipe = c_replica.pipeline(transaction=False)
@@ -788,5 +833,41 @@ async def test_auth_master(df_local_factory, n_keys=20):
     # Check keys are on replica
     res = await c_replica.mget(k for k, _ in gen_test_data(n_keys))
     assert all(v is not None for v in res)
+    await c_master.connection_pool.disconnect()
+    await c_replica.connection_pool.disconnect()
+
+
+SCRIPT_TEMPLATE = "return {}"
+
+
+@dfly_args({"proactor_threads": 2})
+async def test_script_transfer(df_local_factory):
+    master = df_local_factory.create(port=BASE_PORT)
+    replica = df_local_factory.create(port=BASE_PORT+1)
+
+    df_local_factory.start_all([master, replica])
+
+    c_master = aioredis.Redis(port=master.port)
+    c_replica = aioredis.Redis(port=replica.port)
+
+    # Load some scripts into master ahead
+    scripts = []
+    for i in range(0, 10):
+        sha = await c_master.script_load(SCRIPT_TEMPLATE.format(i))
+        scripts.append(sha)
+
+    await c_replica.execute_command(f"REPLICAOF localhost {master.port}")
+    await wait_available_async(c_replica)
+
+    # transfer in stable state
+    for i in range(10, 20):
+        sha = await c_master.script_load(SCRIPT_TEMPLATE.format(i))
+        scripts.append(sha)
+
+    await check_all_replicas_finished([c_replica], c_master)
+    await c_replica.execute_command("REPLICAOF NO ONE")
+
+    for i, sha in enumerate(scripts):
+        assert await c_replica.evalsha(sha, 0) == i
     await c_master.connection_pool.disconnect()
     await c_replica.connection_pool.disconnect()
