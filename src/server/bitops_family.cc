@@ -583,48 +583,52 @@ void BitCount(CmdArgList args, ConnectionContext* cntx) {
 namespace {
 using BitfieldFunctionVector = std::vector<std::function<int64_t()>>;
 
-bool UpdateBitfieldOverflow(CmdArgList& args, BitfieldOverflowMode& mode) {
-  if (args.size() != 2) {
+enum class BitfieldOverflowMode {
+  kWrap,
+  kSat,
+  kFail,
+};
+
+bool UpdateBitfieldOverflow(CmdArgList* args, BitfieldOverflowMode* mode) {
+  if (args->size() != 2) {
     return false;
   }
-  ToUpper(&args[1]);
-  std::string_view new_mode = ArgS(args, 1);
+  ToUpper(&(*args)[1]);
+  std::string_view new_mode = ArgS(*args, 1);
   if (new_mode == "WRAP") {
-    mode = BitfieldOverflowMode::kWrap;
+    *mode = BitfieldOverflowMode::kWrap;
   } else if (new_mode == "SAT") {
-    mode = BitfieldOverflowMode::kSat;
+    *mode = BitfieldOverflowMode::kSat;
   } else if (new_mode == "FAIL") {
-    mode = BitfieldOverflowMode::kFail;
+    *mode = BitfieldOverflowMode::kFail;
   } else {
     return false;
   }
-  args.remove_prefix(2);
+  args->remove_prefix(2);
   return true;
 }
 
-std::function<int64_t()> GetBitfieldGetFunction(CmdArgList& args) {
-  DCHECK_EQ(ArgS(args, 0), "GET");
+std::function<int64_t()> GetBitfieldGetFunction(CmdArgList* args) {
+  DCHECK_EQ(ArgS(*args, 0), "GET");
 
-  if (args.size() < 3) {
+  if (args->size() < 3) {
     return nullptr;
   }
 
   uint64_t offset = 0;
-  if (!absl::SimpleAtoi(ArgS(args, 1), &offset)) {
+  if (!absl::SimpleAtoi(ArgS(*args, 1), &offset)) {
     return nullptr;
   }
-
-  if (
 }
 
 // Returns false if `args` is invalid, otherwise removes all sub-command relevant args from `args`.
 // If both needed and successful, adds a function to `functions_to_run`.
-bool ConsumeBitFieldSubCommand(CmdArgList& args, BitfieldOverflowMode& mode,
-                               BitfieldFunctionVector& functions_to_run) {
-  CHECK_GE(args.size(), 1U);
+bool ConsumeBitFieldSubCommand(CmdArgList* args, BitfieldOverflowMode* mode,
+                               BitfieldFunctionVector* functions_to_run) {
+  CHECK_GE(args->size(), 1U);
 
-  ToUpper(&args[0]);
-  std::string_view sub_command = ArgS(args, 0);
+  ToUpper(&(*args)[0]);
+  std::string_view sub_command = ArgS(*args, 0);
 
   if (sub_command == "OVERFLOW") {
     return UpdateBitfieldOverflow(args, mode);
@@ -643,7 +647,7 @@ bool ConsumeBitFieldSubCommand(CmdArgList& args, BitfieldOverflowMode& mode,
     return false;
   }
 
-  functions_to_run.push_back(std::move(func));
+  functions_to_run->push_back(std::move(func));
   return true;
 }
 }  // anonymous namespace
@@ -662,7 +666,7 @@ void BitField(CmdArgList args, ConnectionContext* cntx) {
   BitfieldOverflowMode overflow_mode = BitfieldOverflowMode::kWrap;
   args.remove_prefix(1);
   while (!args.empty()) {
-    if (!ConsumeBitFieldSubCommand(args, overflow_mode, functions)) {
+    if (!ConsumeBitFieldSubCommand(&args, &overflow_mode, &functions)) {
       return (*cntx)->SendError(kSyntaxErr);
     }
   }
